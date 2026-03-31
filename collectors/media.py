@@ -95,19 +95,22 @@ class BatchedMediaPipeline:
         for local_path, drive_path, att_id in batch:
             try:
                 if self.drive:
+                    # Upload to Drive, then delete local
                     await self.drive.upload_file(str(local_path), drive_path)
-                await self.db.mark_attachment_uploaded(att_id, drive_path)
+                    await self.db.mark_attachment_uploaded(att_id, drive_path)
+                    try:
+                        if local_path.exists():
+                            local_path.unlink()
+                    except OSError:
+                        pass
+                else:
+                    # No Drive yet — keep file in temp/, mark as downloaded (pending upload)
+                    await self.db.mark_attachment_downloaded(att_id, drive_path)
+
             except Exception as e:
                 logger.error(f"Upload failed {local_path.name}: {e}")
                 await self.db.mark_attachment_failed(att_id)
                 self.total_failed += 1
-            finally:
-                # ALWAYS delete temp file
-                try:
-                    if local_path.exists():
-                        local_path.unlink()
-                except OSError:
-                    pass
 
         logger.info(f"Batch flush complete. Total: {self.total_downloaded} downloaded, {self.total_skipped} skipped, {self.total_failed} failed")
 

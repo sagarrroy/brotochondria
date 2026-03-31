@@ -177,6 +177,13 @@ class Database:
             [att_id]
         )
 
+    async def mark_attachment_downloaded(self, att_id: str, drive_path: str):
+        """Mark attachment as downloaded locally (Drive upload pending)."""
+        await self.execute(
+            "UPDATE attachments SET downloaded = 1, drive_path = ? WHERE id = ?",
+            [drive_path, att_id]
+        )
+
     async def mark_attachment_skipped(self, att_id: str, reason: str):
         await self.execute(
             "UPDATE attachments SET downloaded = 0, skip_reason = ? WHERE id = ?",
