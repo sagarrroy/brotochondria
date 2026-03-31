@@ -62,8 +62,9 @@ class MessageCollector(BaseCollector):
                     channels.append(ch)
         return channels
 
-    async def _crawl_channel(self, channel):
-        """Crawl a single channel with checkpoint-based resume."""
+    async def _crawl_channel(self, channel, _retry: int = 0):
+        """Crawl a single channel with checkpoint-based resume + 503 retry."""
+        MAX_RETRIES = 5
         try:
             # Check checkpoint
             checkpoint = await self.db.get_checkpoint(channel.id)
@@ -140,9 +141,19 @@ class MessageCollector(BaseCollector):
             self.logger.warning(f"No access to #{channel.name}")
             self.status.channels_done += 1
         except Exception as e:
-            self.logger.error(f"Channel #{channel.name} failed: {e}")
-            self.status.errors += 1
-            self.status.channels_done += 1
+            err_str = str(e)
+            # 503 = transient Discord CDN error — retry with backoff
+            if '503' in err_str and _retry < MAX_RETRIES:
+                wait = 2 ** (_retry + 1)  # 2, 4, 8, 16, 32 seconds
+                self.logger.warning(
+                    f"503 on #{channel.name} — retry {_retry + 1}/{MAX_RETRIES} in {wait}s"
+                )
+                await asyncio.sleep(wait)
+                await self._crawl_channel(channel, _retry=_retry + 1)
+            else:
+                self.logger.error(f"Channel #{channel.name} failed (gave up): {e}")
+                self.status.errors += 1
+                self.status.channels_done += 1
 
     def _extract_message(self, message: discord.Message) -> dict:
         """Extract all fields from a message into a dict for DB insert."""
