@@ -25,7 +25,7 @@ class Database:
         # Performance PRAGMAs
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.execute("PRAGMA synchronous=NORMAL")
-        await self.conn.execute("PRAGMA foreign_keys=ON")
+        await self.conn.execute("PRAGMA foreign_keys=OFF")   # OFF: thread IDs aren't in channels table
         await self.conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
 
         # Create all tables
