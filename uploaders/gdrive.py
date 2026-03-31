@@ -28,7 +28,7 @@ class DriveUploader:
         self.service = None
         self.root_folder_id = None
         self.folder_cache: dict[str, str] = {}  # path → folder_id
-        self.upload_sem = asyncio.Semaphore(2)  # Max 2 concurrent uploads
+        self.upload_sem = asyncio.Semaphore(1)  # 1 at a time — prevents SSL conflicts
         self.manifest_path = Path("output/upload_manifest.json")
         self.manifest: dict[str, str] = {}  # local_path → drive_file_id
         self._load_manifest()
@@ -115,8 +115,10 @@ class DriveUploader:
 
             await asyncio.to_thread(self._upload_sync, local_path, drive_path)
 
-    def _upload_sync(self, local_path: str, drive_path: str):
-        """Synchronous upload (called via to_thread)."""
+    def _upload_sync(self, local_path: str, drive_path: str, _retry: int = 0):
+        """Synchronous upload with SSL retry (called via to_thread)."""
+        import time, ssl
+        MAX_RETRIES = 4
         try:
             # Ensure parent folders exist
             parent_path = str(Path(drive_path).parent)
@@ -127,13 +129,10 @@ class DriveUploader:
 
             media = MediaFileUpload(
                 local_path,
-                resumable=file_size > 5 * 1024 * 1024,  # Resumable for >5MB
+                resumable=file_size > 5 * 1024 * 1024,
             )
 
-            metadata = {
-                'name': filename,
-                'parents': [folder_id],
-            }
+            metadata = {'name': filename, 'parents': [folder_id]}
 
             file = self.service.files().create(
                 body=metadata,
@@ -145,6 +144,13 @@ class DriveUploader:
             self._save_manifest()
 
         except Exception as e:
+            err = str(e)
+            # SSL errors are transient — retry with backoff
+            if _retry < MAX_RETRIES and any(x in err for x in ['SSL', 'ssl', 'WRONG_VERSION', 'DECRYPTION', 'ConnectionReset']):
+                wait = 2 ** (_retry + 1)  # 2, 4, 8, 16s
+                logger.warning(f"SSL error on {Path(drive_path).name}, retry {_retry+1}/{MAX_RETRIES} in {wait}s")
+                time.sleep(wait)
+                return self._upload_sync(local_path, drive_path, _retry + 1)
             logger.error(f"Drive upload failed for {drive_path}: {e}")
             raise
 
