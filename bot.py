@@ -1,12 +1,13 @@
 """
 Brotochondria — Discord Server Extraction Engine
-Entry point. The bot is a ghost. Zero server messages. All progress via DM.
+Entry point. TRUE ghost mode: ZERO slash commands, ZERO server presence.
+All control via DM. The bot is invisible.
 """
 import asyncio
 import traceback
+from datetime import datetime, timezone
 
 import discord
-from discord import app_commands
 
 from config import (
     BOT_TOKEN, GUILD_ID, OWNER_USER_ID,
@@ -25,15 +26,47 @@ logger = get_logger('bot')
 
 intents = discord.Intents.all()
 bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
 
 db = Database(DB_PATH)
 status = ExtractionStatus()
 progress = SilentProgress(bot, OWNER_USER_ID)
 rate_tracker = GlobalRateTracker()
 
-# Drive uploader — initialized on /upload
+# Drive uploader — initialized on !upload
 drive_uploader = None
+
+# ── Color Palette ─────────────────────────────────────────────────
+COLORS = {
+    'primary':    0x7B68EE,  # Medium Slate Blue
+    'success':    0x2ECC71,  # Emerald
+    'warning':    0xF39C12,  # Orange
+    'danger':     0xE74C3C,  # Red
+    'info':       0x3498DB,  # Blue
+    'purple':     0x9B59B6,  # Amethyst
+    'dark':       0x2C3E50,  # Dark blue-grey
+    'gold':       0xF1C40F,  # Gold
+    'teal':       0x1ABC9C,  # Teal
+}
+
+# DM command prefix
+PREFIX = "!"
+
+# Help text
+HELP_TEXT = """
+**⚡ Brotochondria — Command Center**
+
+```
+!start    → Begin or resume extraction
+!status   → Live extraction progress
+!search   → Search the archive (e.g. !search keyword)
+!verify   → Integrity & completeness report
+!upload   → Push everything to Google Drive
+!stats    → Archive statistics
+!help     → This message
+```
+
+*All commands work here in DMs only. The bot is invisible in the server.*
+"""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -45,112 +78,425 @@ async def on_ready():
     await db.init()
     await db.mark_crashed_runs()
 
-    # Sync slash commands to the guild
-    guild_obj = discord.Object(id=GUILD_ID)
-    tree.copy_global_to(guild=guild_obj)
-    await tree.sync(guild=guild_obj)
+    # Clear ANY existing slash commands (remove old ones if they exist)
+    try:
+        guild_obj = discord.Object(id=GUILD_ID)
+        bot.tree.clear_commands(guild=guild_obj)
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync(guild=guild_obj)
+        await bot.tree.sync()
+        logger.info("Cleared all slash commands — true ghost mode")
+    except Exception as e:
+        logger.debug(f"Slash command cleanup: {e}")
+
+    # Set invisible status — no "Playing..." or activity
+    await bot.change_presence(status=discord.Status.invisible)
 
     logger.info(f"⚡ Brotochondria online as {bot.user}")
     logger.info(f"   Guild: {GUILD_ID}")
     logger.info(f"   Owner: {OWNER_USER_ID}")
-    logger.info("   Slash commands synced. Waiting for /start")
+    logger.info("   Mode: TRUE GHOST — zero slash commands, invisible status")
+    logger.info("   Control: DM the bot with !help")
+
+    # Send startup DM to owner
+    await progress.init()
+    await progress.send(embed=_build_startup_embed())
 
 
-# ═══════════════════════════════════════════════════════════════════
-# SLASH COMMANDS — ALL EPHEMERAL (ghost mode)
-# ═══════════════════════════════════════════════════════════════════
-
-@tree.command(name="start", description="Begin or resume server extraction")
-async def cmd_start(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "⚡ Extraction starting. Check your DMs for progress.", ephemeral=True
-    )
-    asyncio.create_task(_run_extraction_safe(interaction.guild))
-
-
-@tree.command(name="status", description="Check extraction progress")
-async def cmd_status(interaction: discord.Interaction):
-    embed = progress._build_progress_embed(status)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@tree.command(name="search", description="Search the archive")
-@app_commands.describe(query="Search term")
-async def cmd_search(interaction: discord.Interaction, query: str):
-    results = await db.search_messages(query)
-    if not results:
-        await interaction.response.send_message(
-            f"No results for **{query}**", ephemeral=True
-        )
+@bot.event
+async def on_message(message: discord.Message):
+    """Handle DM commands from the owner ONLY."""
+    # Ignore self
+    if message.author.id == bot.user.id:
         return
 
+    # Only respond to the owner
+    if message.author.id != OWNER_USER_ID:
+        return
+
+    # Only respond in DMs
+    if not isinstance(message.channel, discord.DMChannel):
+        return
+
+    content = message.content.strip().lower()
+
+    if not content.startswith(PREFIX):
+        return
+
+    cmd = content[len(PREFIX):].split()[0] if content[len(PREFIX):] else ""
+    args = content[len(PREFIX):].split()[1:] if len(content[len(PREFIX):].split()) > 1 else []
+
+    if cmd == "help":
+        await message.channel.send(HELP_TEXT)
+
+    elif cmd == "start":
+        await message.channel.send(embed=_build_launching_embed())
+        asyncio.create_task(_run_extraction_safe())
+
+    elif cmd == "status":
+        embed = _build_live_status_embed(status)
+        await message.channel.send(embed=embed)
+
+    elif cmd == "search":
+        query = " ".join(args) if args else None
+        if not query:
+            await message.channel.send("Usage: `!search <keyword>`")
+            return
+        await _handle_search(message.channel, query)
+
+    elif cmd == "verify":
+        await _handle_verify(message.channel)
+
+    elif cmd == "upload":
+        await message.channel.send(embed=_build_upload_starting_embed())
+        asyncio.create_task(_run_upload_safe())
+
+    elif cmd == "stats":
+        await _handle_stats(message.channel)
+
+    else:
+        await message.channel.send(f"Unknown command `!{cmd}`. Type `!help` for commands.")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PREMIUM EMBEDS
+# ═══════════════════════════════════════════════════════════════════
+
+def _build_startup_embed() -> discord.Embed:
     embed = discord.Embed(
-        title=f"🔍 Search: {query}",
-        description=f"{len(results)} result(s)",
-        color=0x7B68EE,
+        title="⚡ Brotochondria Online",
+        description=(
+            "```\n"
+            "╔══════════════════════════════════╗\n"
+            "║   EXTRACTION ENGINE ACTIVATED    ║\n"
+            "║   Ghost Mode: ENABLED            ║\n"
+            "║   Slash Commands: NONE           ║\n"
+            "║   Server Footprint: ZERO         ║\n"
+            "╚══════════════════════════════════╝\n"
+            "```"
+        ),
+        color=COLORS['primary'],
+        timestamp=datetime.now(timezone.utc),
     )
-    for r in results[:10]:
-        content_preview = (r['content'] or '')[:100]
-        ch_name = r.get('channel_id', '?')
-        embed.add_field(
-            name=f"{r['author_name']} — {r['created_at'][:10]}",
-            value=content_preview or "(no text)",
-            inline=False,
-        )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@tree.command(name="verify", description="Check archive integrity")
-async def cmd_verify(interaction: discord.Interaction):
-    stats = await db.get_stats()
-    latest_run = await db.get_latest_run()
-
-    embed = discord.Embed(title="🔒 Integrity Report", color=0x00FF00)
-    embed.add_field(name="Messages", value=f"{stats.get('messages', 0):,}", inline=True)
-    embed.add_field(name="Attachments", value=f"{stats.get('attachments_downloaded', 0)}/{stats.get('attachments', 0)}", inline=True)
-    embed.add_field(name="Links", value=f"{stats.get('links', 0):,}", inline=True)
-    embed.add_field(name="Members", value=f"{stats.get('members', 0):,}", inline=True)
-    embed.add_field(name="Threads", value=f"{stats.get('threads', 0):,}", inline=True)
-    embed.add_field(name="Embeds", value=f"{stats.get('embeds', 0):,}", inline=True)
-
-    if latest_run:
-        embed.add_field(
-            name="Last Run",
-            value=f"Status: {latest_run['status']} | Started: {latest_run['started_at']}",
-            inline=False,
-        )
-
-    checkpoints = await db.get_all_checkpoints()
-    completed = sum(1 for c in checkpoints if c['completed'])
     embed.add_field(
-        name="Channels",
-        value=f"{completed}/{len(checkpoints)} completed",
+        name="🎮 Controls",
+        value="All commands work **here in DMs only**.\nType `!help` to see commands.",
+        inline=False,
+    )
+    embed.add_field(name="📡 Status", value="🟢 Ready", inline=True)
+    embed.add_field(name="👻 Visibility", value="Invisible", inline=True)
+    embed.add_field(name="⚔️ Mode", value="Awaiting orders", inline=True)
+    embed.set_footer(text="Brotochondria v1.0 — Total Extraction Engine")
+    return embed
+
+
+def _build_launching_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="🚀 Extraction Launching",
+        description=(
+            "```diff\n"
+            "+ Initializing collectors...\n"
+            "+ Opening parallel channels...\n"
+            "+ Media pipeline armed...\n"
+            "+ Ghost mode locked.\n"
+            "```"
+        ),
+        color=COLORS['gold'],
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="📊 Updates",
+        value="Progress embeds will appear here every **5 minutes**.",
+        inline=False,
+    )
+    embed.set_footer(text="Type !status for a live check anytime")
+    return embed
+
+
+def _build_live_status_embed(s: ExtractionStatus) -> discord.Embed:
+    """The premium live status embed."""
+    elapsed = s.elapsed
+    hours, remainder = divmod(elapsed, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    time_str = f"{hours}h {minutes}m {seconds}s"
+
+    # Dynamic color based on phase
+    if s.is_complete:
+        color = COLORS['success']
+        title = "✅ Extraction Complete"
+    elif s.errors > 10:
+        color = COLORS['warning']
+        title = "⚠️ Extraction In Progress (with errors)"
+    else:
+        color = COLORS['primary']
+        title = "⚡ Live Extraction Status"
+
+    embed = discord.Embed(
+        title=title,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # Phase banner
+    embed.add_field(
+        name="📋 Current Phase",
+        value=f"```\n{s.phase}\n```",
         inline=False,
     )
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    # Progress bar
+    if s.channels_total > 0:
+        pct = (s.channels_done / s.channels_total) * 100
+        filled = int(pct / 5)
+        bar = '▓' * filled + '░' * (20 - filled)
+        embed.add_field(
+            name="📈 Overall Progress",
+            value=f"`{bar}` **{pct:.1f}%**",
+            inline=False,
+        )
 
-
-@tree.command(name="upload", description="Upload archive to Google Drive")
-async def cmd_upload(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "☁️ Starting Google Drive upload. Check DMs.", ephemeral=True
+    # Core metrics — 2x3 grid
+    embed.add_field(
+        name="📡 Channels",
+        value=f"```\n{s.channels_done} / {s.channels_total}\n```",
+        inline=True,
     )
-    asyncio.create_task(_run_upload_safe())
+    embed.add_field(
+        name="💬 Messages",
+        value=f"```\n{s.messages_done:,}\n```",
+        inline=True,
+    )
+    embed.add_field(
+        name="📎 Media",
+        value=f"```\n{s.media_done:,} ✓ | {s.media_skipped:,} ⏭\n```",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="⚡ Speed",
+        value=f"```\n{s.messages_per_second:.1f} msg/s\n```",
+        inline=True,
+    )
+    embed.add_field(
+        name="❌ Errors",
+        value=f"```\n{s.errors}\n```",
+        inline=True,
+    )
+    embed.add_field(
+        name="⏱️ Elapsed",
+        value=f"```\n{time_str}\n```",
+        inline=True,
+    )
+
+    # ETA estimate
+    if s.channels_total > 0 and s.channels_done > 0 and not s.is_complete:
+        rate = elapsed / s.channels_done
+        remaining = (s.channels_total - s.channels_done) * rate
+        eta_h, eta_rem = divmod(int(remaining), 3600)
+        eta_m, _ = divmod(eta_rem, 60)
+        embed.add_field(
+            name="🕐 Estimated Time Remaining",
+            value=f"```\n~{eta_h}h {eta_m}m\n```",
+            inline=False,
+        )
+
+    embed.set_footer(text="Brotochondria — Ghost Mode Active | !status to refresh")
+    return embed
+
+
+def _build_completion_embed(s: ExtractionStatus) -> discord.Embed:
+    elapsed = s.elapsed
+    hours, remainder = divmod(elapsed, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    embed = discord.Embed(
+        title="🏆 Extraction Complete!",
+        description=(
+            "```diff\n"
+            "+ All channels processed\n"
+            "+ All messages captured\n"
+            "+ All media downloaded\n"
+            "+ Database sealed\n"
+            "+ Exports generated\n"
+            "```"
+        ),
+        color=COLORS['success'],
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="💬 Messages", value=f"**{s.messages_done:,}**", inline=True)
+    embed.add_field(name="📎 Media", value=f"**{s.media_done:,}**", inline=True)
+    embed.add_field(name="📡 Channels", value=f"**{s.channels_done}**", inline=True)
+    embed.add_field(name="❌ Errors", value=f"**{s.errors}**", inline=True)
+    embed.add_field(name="⚡ Avg Speed", value=f"**{s.messages_per_second:.1f}** msg/s", inline=True)
+    embed.add_field(name="⏱️ Total Time", value=f"**{hours}h {minutes}m**", inline=True)
+    embed.add_field(
+        name="📋 Next Steps",
+        value=(
+            "```\n"
+            "!verify  → Check integrity\n"
+            "!search  → Search the archive\n"
+            "!upload  → Push to Google Drive\n"
+            "!stats   → View statistics\n"
+            "```"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Brotochondria v1.0 — Your server is immortalized.")
+    return embed
+
+
+def _build_upload_starting_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="☁️ Google Drive Upload",
+        description=(
+            "```\n"
+            "Authenticating with Google...\n"
+            "Preparing file manifest...\n"
+            "```"
+        ),
+        color=COLORS['info'],
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="This may take a while depending on archive size")
+    return embed
+
+
+# ═══════════════════════════════════════════════════════════════════
+# COMMAND HANDLERS
+# ═══════════════════════════════════════════════════════════════════
+
+async def _handle_search(channel, query: str):
+    results = await db.search_messages(query)
+    if not results:
+        embed = discord.Embed(
+            title=f"🔍 No Results",
+            description=f"Nothing found for **{query}**",
+            color=COLORS['dark'],
+        )
+        await channel.send(embed=embed)
+        return
+
+    embed = discord.Embed(
+        title=f"🔍 Search Results — \"{query}\"",
+        description=f"**{len(results)}** result(s) found",
+        color=COLORS['purple'],
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    for i, r in enumerate(results[:10], 1):
+        preview = (r['content'] or '')[:120]
+        date = r['created_at'][:10] if r['created_at'] else '?'
+        author = r.get('author_display_name') or r.get('author_name', '?')
+        embed.add_field(
+            name=f"#{i} — {author} • {date}",
+            value=f"```\n{preview or '(no text)'}\n```",
+            inline=False,
+        )
+
+    embed.set_footer(text=f"Showing top {min(len(results), 10)} of {len(results)} | FTS5 search")
+    await channel.send(embed=embed)
+
+
+async def _handle_verify(channel):
+    stats = await db.get_stats()
+    latest_run = await db.get_latest_run()
+    checkpoints = await db.get_all_checkpoints()
+    completed = sum(1 for c in checkpoints if c['completed'])
+
+    embed = discord.Embed(
+        title="🔒 Archive Integrity Report",
+        color=COLORS['teal'],
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # Completion status
+    all_done = completed == len(checkpoints) and len(checkpoints) > 0
+    status_icon = "🟢" if all_done else "🟡"
+    embed.add_field(
+        name="📡 Channel Coverage",
+        value=f"```\n{status_icon} {completed} / {len(checkpoints)} channels completed\n```",
+        inline=False,
+    )
+
+    # Data counts
+    embed.add_field(name="💬 Messages", value=f"**{stats.get('messages', 0):,}**", inline=True)
+    embed.add_field(
+        name="📎 Attachments",
+        value=f"**{stats.get('attachments_downloaded', 0):,}** / {stats.get('attachments', 0):,}",
+        inline=True,
+    )
+    embed.add_field(name="🔗 Links", value=f"**{stats.get('links', 0):,}**", inline=True)
+    embed.add_field(name="👥 Members", value=f"**{stats.get('members', 0):,}**", inline=True)
+    embed.add_field(name="🧵 Threads", value=f"**{stats.get('threads', 0):,}**", inline=True)
+    embed.add_field(name="📦 Embeds", value=f"**{stats.get('embeds', 0):,}**", inline=True)
+    embed.add_field(name="😀 Emojis", value=f"**{stats.get('emojis', 0):,}**", inline=True)
+    embed.add_field(name="🎨 Stickers", value=f"**{stats.get('stickers', 0):,}**", inline=True)
+    embed.add_field(name="🔁 Reactions", value=f"**{stats.get('reactions', 0):,}**", inline=True)
+
+    if latest_run:
+        run_status = latest_run.get('status', '?')
+        run_icon = '🟢' if run_status == 'completed' else '🔴' if run_status == 'crashed' else '🟡'
+        embed.add_field(
+            name="🏃 Last Extraction Run",
+            value=f"```\n{run_icon} {run_status.upper()} | {latest_run.get('started_at', '?')}\n```",
+            inline=False,
+        )
+
+    verdict = "✅ LOSSLESS" if all_done else "⚠️ INCOMPLETE — re-run !start to resume"
+    embed.add_field(name="📋 Verdict", value=f"**{verdict}**", inline=False)
+    embed.set_footer(text="Brotochondria — Integrity Verification Engine")
+
+    await channel.send(embed=embed)
+
+
+async def _handle_stats(channel):
+    stats = await db.get_stats()
+    server = await db.fetch_one("SELECT * FROM server LIMIT 1")
+    server_name = server['name'] if server else 'Unknown'
+
+    embed = discord.Embed(
+        title=f"📊 Archive Statistics — {server_name}",
+        color=COLORS['gold'],
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.add_field(name="💬 Messages", value=f"`{stats.get('messages', 0):,}`", inline=True)
+    embed.add_field(name="👥 Members", value=f"`{stats.get('members', 0):,}`", inline=True)
+    embed.add_field(name="📎 Attachments", value=f"`{stats.get('attachments', 0):,}`", inline=True)
+    embed.add_field(name="🔗 Links", value=f"`{stats.get('links', 0):,}`", inline=True)
+    embed.add_field(name="🧵 Threads", value=f"`{stats.get('threads', 0):,}`", inline=True)
+    embed.add_field(name="📦 Embeds", value=f"`{stats.get('embeds', 0):,}`", inline=True)
+    embed.add_field(name="😀 Emojis", value=f"`{stats.get('emojis', 0):,}`", inline=True)
+    embed.add_field(name="🎨 Stickers", value=f"`{stats.get('stickers', 0):,}`", inline=True)
+    embed.add_field(name="🔁 Reactions", value=f"`{stats.get('reactions', 0):,}`", inline=True)
+
+    dl = stats.get('attachments_downloaded', 0)
+    total = stats.get('attachments', 0)
+    pct = (dl / total * 100) if total > 0 else 0
+    embed.add_field(
+        name="📦 Download Rate",
+        value=f"`{dl:,} / {total:,}` ({pct:.0f}%)",
+        inline=False,
+    )
+
+    embed.set_footer(text="Brotochondria — Your server, immortalized")
+    await channel.send(embed=embed)
 
 
 # ═══════════════════════════════════════════════════════════════════
 # ORCHESTRATION
 # ═══════════════════════════════════════════════════════════════════
 
-async def _run_extraction_safe(guild):
+async def _run_extraction_safe():
     """Wrapper with error handling for the main extraction."""
     try:
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            guild = await bot.fetch_guild(GUILD_ID)
         await run_extraction(guild)
     except Exception as e:
         logger.error(f"Extraction failed: {e}\n{traceback.format_exc()}")
-        await progress.send(f"❌ Extraction failed: {e}")
+        await progress.send(f"❌ **Extraction failed:** `{e}`")
 
 
 async def run_extraction(guild):
@@ -158,12 +504,16 @@ async def run_extraction(guild):
     global status
     status = ExtractionStatus()
 
-    await progress.init()
-    await progress.send("🚀 **Phase 1/4** — Extracting server metadata, channels, members...")
+    phase_embed = discord.Embed(
+        title="🚀 Phase 1/4 — Metadata",
+        description="Extracting server info, channels, members, roles...",
+        color=COLORS['info'],
+    )
+    await progress.send(embed=phase_embed)
 
     run_id = await db.start_run("full")
 
-    # Initialize media pipeline (no Drive upload during extraction — just download)
+    # Initialize media pipeline
     media_mod.media_pipeline = BatchedMediaPipeline(db, drive_uploader)
 
     # ── Group 1: Sequential metadata (fast) ──────────────────────
@@ -175,7 +525,12 @@ async def run_extraction(guild):
         collector = CollectorClass(bot, db, guild, status, rate_tracker)
         await collector.run()
 
-    await progress.send("📨 **Phase 2/4** — Crawling messages, threads, and audit log (parallel)...")
+    phase_embed = discord.Embed(
+        title="📨 Phase 2/4 — Messages & Threads",
+        description="Parallel crawling across all channels...\nProgress updates every 5 minutes.",
+        color=COLORS['primary'],
+    )
+    await progress.send(embed=phase_embed)
 
     # ── Group 2: Parallel heavy collectors ────────────────────────
     from collectors.messages import MessageCollector
@@ -184,8 +539,8 @@ async def run_extraction(guild):
     from collectors.emojis_stickers import EmojiStickerCollector
     from collectors.misc import MiscCollector
 
-    # Start progress loop
-    progress_task = asyncio.create_task(progress.progress_loop(status))
+    # Start progress loop — sends live embeds every 5 min
+    progress_task = asyncio.create_task(_progress_loop())
 
     collectors = [
         MessageCollector(bot, db, guild, status, rate_tracker),
@@ -196,10 +551,15 @@ async def run_extraction(guild):
     ]
     await asyncio.gather(*[c.run() for c in collectors])
 
-    # Finalize media (flush remaining downloads)
+    # Finalize media
     await media_mod.media_pipeline.finalize()
 
-    await progress.send("📦 **Phase 3/4** — Exporting to JSON + Markdown...")
+    phase_embed = discord.Embed(
+        title="📦 Phase 3/4 — Exporting",
+        description="Generating JSON, Markdown, link directories, indexes...",
+        color=COLORS['purple'],
+    )
+    await progress.send(embed=phase_embed)
 
     # ── Group 3: Export ────────────────────────────────────────────
     from exporters.json_exporter import JsonExporter
@@ -217,10 +577,9 @@ async def run_extraction(guild):
     # ── Complete ──────────────────────────────────────────────────
     status.is_complete = True
 
-    # Wait for progress loop to send final embed
     try:
         await asyncio.wait_for(progress_task, timeout=30)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError):
         pass
 
     await db.complete_run(
@@ -230,19 +589,26 @@ async def run_extraction(guild):
         media_downloaded=status.media_done,
     )
 
-    await progress.send(
-        "✅ **Extraction complete!**\n"
-        f"• Messages: {status.messages_done:,}\n"
-        f"• Media: {status.media_done:,}\n"
-        f"• Errors: {status.errors}\n\n"
-        "Run `/verify` to check integrity.\n"
-        "Run `/upload` to push to Google Drive."
-    )
+    # Send the gorgeous completion embed
+    await progress.send(embed=_build_completion_embed(status))
 
     logger.info(
         f"Extraction complete: {status.messages_done:,} messages, "
         f"{status.media_done:,} media, {status.errors} errors"
     )
+
+
+async def _progress_loop():
+    """Send beautiful live status embeds every 5 minutes."""
+    try:
+        while not status.is_complete:
+            embed = _build_live_status_embed(status)
+            await progress.send(embed=embed)
+            await asyncio.sleep(300)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"Progress loop error: {e}")
 
 
 async def _run_upload_safe():
@@ -251,29 +617,57 @@ async def _run_upload_safe():
     try:
         from uploaders.gdrive import DriveUploader
 
-        await progress.send("☁️ Authenticating with Google Drive...")
+        embed = discord.Embed(
+            title="☁️ Authenticating with Google Drive...",
+            color=COLORS['info'],
+        )
+        await progress.send(embed=embed)
+
         drive_uploader = DriveUploader(GDRIVE_FOLDER_NAME)
         drive_uploader.authenticate()
 
-        await progress.send("☁️ Uploading exports to Drive...")
+        embed = discord.Embed(
+            title="☁️ Uploading to Google Drive",
+            description="Pushing exports, database, and indexes...",
+            color=COLORS['info'],
+        )
+        await progress.send(embed=embed)
+
         await drive_uploader.upload_directory(EXPORTS_DIR)
 
-        # Also upload the database itself
         db_path = DB_PATH
         if db_path.exists():
             await drive_uploader.upload_file(str(db_path), "brotochondria.db")
 
-        await progress.send(
-            "✅ **Google Drive upload complete!**\n"
-            f"📁 Folder: `{GDRIVE_FOLDER_NAME}`\n"
-            f"📊 Files uploaded: {len(drive_uploader.manifest):,}"
+        embed = discord.Embed(
+            title="✅ Google Drive Upload Complete!",
+            description=(
+                f"```\n"
+                f"📁 Folder: {GDRIVE_FOLDER_NAME}\n"
+                f"📊 Files:  {len(drive_uploader.manifest):,}\n"
+                f"```"
+            ),
+            color=COLORS['success'],
+            timestamp=datetime.now(timezone.utc),
         )
+        embed.set_footer(text="Your server archive is now in the cloud")
+        await progress.send(embed=embed)
 
     except FileNotFoundError as e:
-        await progress.send(f"❌ Upload failed: {e}\nMake sure `credentials.json` is in the project root.")
+        embed = discord.Embed(
+            title="❌ Upload Failed",
+            description=f"```\n{e}\n```\nMake sure `credentials.json` is in the project root.",
+            color=COLORS['danger'],
+        )
+        await progress.send(embed=embed)
     except Exception as e:
         logger.error(f"Upload failed: {e}\n{traceback.format_exc()}")
-        await progress.send(f"❌ Upload failed: {e}")
+        embed = discord.Embed(
+            title="❌ Upload Failed",
+            description=f"```\n{e}\n```",
+            color=COLORS['danger'],
+        )
+        await progress.send(embed=embed)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -281,4 +675,4 @@ async def _run_upload_safe():
 # ═══════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    bot.run(BOT_TOKEN, log_handler=None)  # We use our own logger
+    bot.run(BOT_TOKEN, log_handler=None)
