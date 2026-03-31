@@ -146,7 +146,9 @@ class MessageCollector(BaseCollector):
 
     def _extract_message(self, message: discord.Message) -> dict:
         """Extract all fields from a message into a dict for DB insert."""
-        is_fwd = message.type == discord.MessageType.forward_message
+        # Safe check — forward_message doesn't exist in all discord.py versions
+        _fwd_type = getattr(discord.MessageType, 'forward_message', None)
+        is_fwd = _fwd_type is not None and message.type == _fwd_type
         fwd_author = fwd_content = fwd_ts = None
 
         if is_fwd and hasattr(message, 'message_snapshots') and message.message_snapshots:
@@ -207,7 +209,7 @@ class MessageCollector(BaseCollector):
                 'downloaded': 0,
                 'skip_reason': 'gif' if is_gif else ('too_large' if too_large else None),
                 'drive_path': build_media_drive_path(att, message, channel) if not is_gif and not too_large else None,
-                'is_forwarded': int(message.type == discord.MessageType.forward_message),
+                'is_forwarded': int(getattr(discord.MessageType, 'forward_message', None) is not None and message.type == discord.MessageType.forward_message),
             }
             await self.db.insert_ignore('attachments', att_data)
 

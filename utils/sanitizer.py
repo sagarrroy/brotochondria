@@ -76,7 +76,8 @@ def build_media_filename(attachment, message, channel) -> str:
     channel_name = sanitize_filename(channel.name)[:20]
     original = sanitize_filename(attachment.filename)
 
-    is_forwarded = message.type == discord.MessageType.forward_message
+    _fwd_type = getattr(discord.MessageType, 'forward_message', None)
+    is_forwarded = _fwd_type is not None and message.type == _fwd_type
     fwd = "FWD_" if is_forwarded else ""
 
     filename = f"{date_str}_{username}_{channel_name}_{fwd}{original}"
