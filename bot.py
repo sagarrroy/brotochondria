@@ -633,24 +633,56 @@ async def _run_upload_safe():
         )
         await progress.send(embed=embed)
 
-        await drive_uploader.upload_directory(EXPORTS_DIR)
+        # 1. Upload exports (JSON, Markdown, indexes)
+        exports_count = 0
+        if EXPORTS_DIR.exists():
+            await progress.send(embed=discord.Embed(
+                title="☁️ Uploading exports...",
+                description="JSON, Markdown, link directories, indexes",
+                color=COLORS['info'],
+            ))
+            await drive_uploader.upload_directory(EXPORTS_DIR, drive_prefix="exports")
+            exports_count = len(list(EXPORTS_DIR.rglob("*")))
 
-        db_path = DB_PATH
-        if db_path.exists():
-            await drive_uploader.upload_file(str(db_path), "brotochondria.db")
+        # 2. Upload media from temp/ → _media/ on Drive, then delete local
+        from config import TEMP_DIR
+        media_count = 0
+        if TEMP_DIR.exists():
+            media_files = [f for f in TEMP_DIR.rglob("*") if f.is_file() and f.name != ".gitkeep"]
+            media_count = len(media_files)
+            if media_files:
+                await progress.send(embed=discord.Embed(
+                    title=f"☁️ Uploading {media_count:,} media files...",
+                    description="This may take a while. Uploading to `_media/` on Drive.",
+                    color=COLORS['info'],
+                ))
+                for f in media_files:
+                    drive_path = f"_media/{f.name}"
+                    try:
+                        await drive_uploader.upload_file(str(f), drive_path)
+                        f.unlink()  # Delete local after successful upload
+                    except Exception as e:
+                        logger.error(f"Media upload failed {f.name}: {e}")
+
+        # 3. Upload the database itself
+        if DB_PATH.exists():
+            await drive_uploader.upload_file(str(DB_PATH), "brotochondria.db")
 
         embed = discord.Embed(
             title="✅ Google Drive Upload Complete!",
             description=(
                 f"```\n"
-                f"📁 Folder: {GDRIVE_FOLDER_NAME}\n"
-                f"📊 Files:  {len(drive_uploader.manifest):,}\n"
+                f"📁 Folder:  {GDRIVE_FOLDER_NAME}\n"
+                f"📄 Exports: {exports_count:,} files\n"
+                f"📎 Media:   {media_count:,} files → deleted locally\n"
+                f"💾 DB:      brotochondria.db\n"
+                f"📊 Total:   {len(drive_uploader.manifest):,} files on Drive\n"
                 f"```"
             ),
             color=COLORS['success'],
             timestamp=datetime.now(timezone.utc),
         )
-        embed.set_footer(text="Your server archive is now in the cloud")
+        embed.set_footer(text="Your server archive is immortalized in the cloud ☁️")
         await progress.send(embed=embed)
 
     except FileNotFoundError as e:

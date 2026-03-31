@@ -24,14 +24,15 @@ class AuditLogCollector(BaseCollector):
                 try:
                     changes = None
                     if entry.changes:
-                        changes_list = []
-                        for change in entry.changes:
-                            changes_list.append({
-                                'attribute': str(change.attribute) if hasattr(change, 'attribute') else str(change.key) if hasattr(change, 'key') else 'unknown',
-                                'before': str(change.before) if change.before is not None else None,
-                                'after': str(change.after) if change.after is not None else None,
+                        try:
+                            # AuditLogChanges is not iterable in discord.py 2.7.x
+                            # Access before/after as object attributes
+                            changes = json.dumps({
+                                'before': {k: str(v) for k, v in entry.changes.before.__dict__.items() if not k.startswith('_')} if entry.changes.before else {},
+                                'after': {k: str(v) for k, v in entry.changes.after.__dict__.items() if not k.startswith('_')} if entry.changes.after else {},
                             })
-                        changes = json.dumps(changes_list)
+                        except Exception:
+                            changes = str(entry.changes)
 
                     await self.db.insert_ignore('audit_log', {
                         'id': str(entry.id),
