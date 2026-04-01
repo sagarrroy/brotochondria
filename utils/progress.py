@@ -130,5 +130,5 @@ class SilentProgress:
         embed.add_field(name="Errors", value=str(s.errors), inline=True)
         embed.add_field(name="Total Time", value=f"{hours}h {minutes}m", inline=True)
         embed.add_field(name="Avg Speed", value=f"{s.messages_per_second:.1f} msg/s", inline=True)
-        embed.set_footer(text="Run /verify to check integrity, then /upload to push to Google Drive.")
+        embed.set_footer(text="Run !verify to check integrity, then !upload to push to Google Drive.")
         return embed

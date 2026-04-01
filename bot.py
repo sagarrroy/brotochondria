@@ -118,13 +118,15 @@ async def on_message(message: discord.Message):
     if not isinstance(message.channel, discord.DMChannel):
         return
 
-    content = message.content.strip().lower()
+    content = message.content.strip()
 
     if not content.startswith(PREFIX):
         return
 
-    cmd = content[len(PREFIX):].split()[0] if content[len(PREFIX):] else ""
-    args = content[len(PREFIX):].split()[1:] if len(content[len(PREFIX):].split()) > 1 else []
+    command_text = content[len(PREFIX):].strip()
+    parts = command_text.split()
+    cmd = parts[0].lower() if parts else ""
+    args = parts[1:] if len(parts) > 1 else []
 
     if cmd == "help":
         await message.channel.send(HELP_TEXT)
@@ -657,7 +659,15 @@ async def _run_upload_safe():
                     color=COLORS['info'],
                 ))
                 for f in media_files:
-                    drive_path = f"_media/{f.name}"
+                    drive_path = f"_media/{f.name}"  # fallback
+                    att_id = f.name.split("_", 1)[0]
+                    if att_id.isdigit():
+                        row = await db.fetch_one(
+                            "SELECT drive_path FROM attachments WHERE id = ?",
+                            [att_id],
+                        )
+                        if row and row.get("drive_path"):
+                            drive_path = row["drive_path"]
                     try:
                         await drive_uploader.upload_file(str(f), drive_path)
                         f.unlink()  # Delete local after successful upload

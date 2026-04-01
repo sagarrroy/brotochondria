@@ -60,15 +60,106 @@ class MarkdownExporter:
                 if not messages:
                     continue
 
+                context = await self._build_message_context(messages)
+
                 lines = [f"# #{channel['name']} — {date_str}\n"]
 
                 for msg in messages:
-                    lines.append(await self._format_message(msg))
+                    lines.append(self._format_message(msg, context))
 
                 file_path = ch_dir / f"{date_str}.md"
                 file_path.write_text('\n'.join(lines), encoding='utf-8')
 
-    async def _format_message(self, msg: dict) -> str:
+            await self._export_pins(channel, ch_dir)
+
+    async def _export_pins(self, channel: dict, ch_dir: Path):
+        """Export pinned messages for a channel to pins.md."""
+        rows = await self.db.fetch_all(
+            """SELECT p.message_id, m.author_display_name, m.author_name, m.content, m.created_at
+               FROM pins p
+               LEFT JOIN messages m ON m.id = p.message_id
+               WHERE p.channel_id = ?
+               ORDER BY m.created_at""",
+            [channel['id']]
+        )
+
+        lines = [
+            f"# #{channel['name']} — Pins",
+            "",
+            f"> {len(rows)} pinned message(s)",
+            "",
+            "---",
+            "",
+        ]
+
+        for row in rows:
+            author = row.get('author_display_name') or row.get('author_name') or 'Unknown'
+            created_at = row.get('created_at') or ''
+            date_str = created_at[:19].replace('T', ' ') if created_at else 'Unknown date'
+            content = (row.get('content') or '').strip()
+
+            lines.append(f"### {author} — {date_str}")
+            if content:
+                lines.append(content)
+            else:
+                lines.append("(no text content)")
+            lines.append(f"`message_id: {row['message_id']}`")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+        (ch_dir / "pins.md").write_text('\n'.join(lines), encoding='utf-8')
+
+    async def _build_message_context(self, messages: list[dict]) -> dict:
+        """Batch-load related message rows to avoid N+1 queries during markdown export."""
+        message_ids = [m['id'] for m in messages if m.get('id')]
+        context = {
+            'attachments': {},
+            'reactions': {},
+            'polls': {},
+            'replies': {},
+        }
+        if not message_ids:
+            return context
+
+        async def fetch_by_ids(table: str) -> list[dict]:
+            rows = []
+            chunk_size = 900
+            for index in range(0, len(message_ids), chunk_size):
+                chunk = message_ids[index:index + chunk_size]
+                placeholders = ','.join('?' for _ in chunk)
+                rows.extend(await self.db.fetch_all(
+                    f"SELECT * FROM {table} WHERE message_id IN ({placeholders})",
+                    chunk,
+                ))
+            return rows
+
+        for row in await fetch_by_ids('attachments'):
+            context['attachments'].setdefault(row['message_id'], []).append(dict(row))
+        for row in await fetch_by_ids('reactions'):
+            context['reactions'].setdefault(row['message_id'], []).append(dict(row))
+        for row in await fetch_by_ids('polls'):
+            context['polls'][row['message_id']] = dict(row)
+
+        reference_ids = sorted({
+            m['reference_message_id']
+            for m in messages
+            if m.get('reference_message_id')
+        })
+        if reference_ids:
+            for index in range(0, len(reference_ids), 900):
+                chunk = reference_ids[index:index + 900]
+                placeholders = ','.join('?' for _ in chunk)
+                rows = await self.db.fetch_all(
+                    f"SELECT id, author_name, content FROM messages WHERE id IN ({placeholders})",
+                    chunk,
+                )
+                for row in rows:
+                    context['replies'][row['id']] = dict(row)
+
+        return context
+
+    def _format_message(self, msg: dict, context: dict) -> str:
         """Format a single message as Markdown."""
         parts = []
 
@@ -81,10 +172,7 @@ class MarkdownExporter:
 
         # Reply
         if msg['reference_message_id']:
-            ref = await self.db.fetch_one(
-                "SELECT author_name, content FROM messages WHERE id = ?",
-                [msg['reference_message_id']]
-            )
+            ref = context['replies'].get(msg['reference_message_id'])
             if ref:
                 preview = (ref['content'] or '')[:80]
                 parts.append(f"> Replying to **{ref['author_name']}**: \"{preview}\"")
@@ -107,9 +195,7 @@ class MarkdownExporter:
             parts.append(content)
 
         # Attachments
-        attachments = await self.db.fetch_all(
-            "SELECT * FROM attachments WHERE message_id = ?", [msg['id']]
-        )
+        attachments = context['attachments'].get(msg['id'], [])
         for att in attachments:
             size_str = _format_size(att['size']) if att['size'] else 'unknown size'
             if att['skip_reason'] == 'gif':
@@ -120,17 +206,13 @@ class MarkdownExporter:
                 parts.append(f"📎 {att['filename']} ({size_str})")
 
         # Reactions
-        reactions = await self.db.fetch_all(
-            "SELECT * FROM reactions WHERE message_id = ?", [msg['id']]
-        )
+        reactions = context['reactions'].get(msg['id'], [])
         if reactions:
             reaction_strs = [f"{r['emoji_name']} {r['count']}" for r in reactions]
             parts.append(" | ".join(reaction_strs))
 
         # Poll
-        poll = await self.db.fetch_one(
-            "SELECT * FROM polls WHERE message_id = ?", [msg['id']]
-        )
+        poll = context['polls'].get(msg['id'])
         if poll:
             parts.append(f"📊 **Poll: {poll['question']}**")
             try:

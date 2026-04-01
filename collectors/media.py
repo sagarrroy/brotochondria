@@ -6,7 +6,14 @@ Peak local disk usage: ~500MB.
 import asyncio
 from pathlib import Path
 
-from config import MEDIA_BATCH_THRESHOLD, TEMP_DIR, GIF_EXTENSIONS, GIF_CONTENT_TYPES, MAX_FILE_SIZE_BYTES
+from config import (
+    MEDIA_BATCH_THRESHOLD,
+    TEMP_DIR,
+    GIF_EXTENSIONS,
+    GIF_CONTENT_TYPES,
+    MAX_FILE_SIZE_BYTES,
+    MAX_CONCURRENT_DOWNLOADS,
+)
 from utils.logger import get_logger
 from utils.sanitizer import build_media_filename, build_media_drive_path, sanitize_filename
 
@@ -25,6 +32,7 @@ class BatchedMediaPipeline:
         self.current_size = 0
         self.pending: list[tuple[Path, str, str]] = []  # (local_path, drive_path, att_id)
         self.lock = asyncio.Lock()
+        self.download_sem = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
         self.total_downloaded = 0
         self.total_failed = 0
         self.total_skipped = 0
@@ -55,14 +63,14 @@ class BatchedMediaPipeline:
             self.total_skipped += 1
             return
 
-        # Build traceable filename
-        stored_name = build_media_filename(attachment, message, channel)
+        # Build traceable drive path
         drive_path = build_media_drive_path(attachment, message, channel)
 
         # Download immediately (CDN URL is fresh)
         local_path = TEMP_DIR / f"{attachment.id}_{sanitize_filename(attachment.filename)}"
         try:
-            await attachment.save(local_path)
+            async with self.download_sem:
+                await attachment.save(local_path)
         except Exception as e:
             logger.warning(f"Download failed {attachment.filename}: {e}")
             await self.db.mark_attachment_failed(str(attachment.id))
@@ -81,7 +89,7 @@ class BatchedMediaPipeline:
             await self.flush()
 
     async def flush(self):
-        """Upload all pending files to Google Drive, then delete local copies."""
+        """Track batch size — files stay in temp/ until manual !upload."""
         async with self.lock:
             batch = self.pending.copy()
             self.pending.clear()
@@ -90,29 +98,17 @@ class BatchedMediaPipeline:
         if not batch:
             return
 
-        logger.info(f"Flushing {len(batch)} media files to Drive ({self._format_size(sum(p.stat().st_size for p, _, _ in batch if p.exists()))})")
+        # Mark all as downloaded (pending manual !upload)
+        total_size = sum(p.stat().st_size for p, _, _ in batch if p.exists())
+        logger.info(f"Media buffer checkpoint: {len(batch)} files ({self._format_size(total_size)}) saved to temp/")
 
         for local_path, drive_path, att_id in batch:
             try:
-                if self.drive:
-                    # Upload to Drive, then delete local
-                    await self.drive.upload_file(str(local_path), drive_path)
-                    await self.db.mark_attachment_uploaded(att_id, drive_path)
-                    try:
-                        if local_path.exists():
-                            local_path.unlink()
-                    except OSError:
-                        pass
-                else:
-                    # No Drive yet — keep file in temp/, mark as downloaded (pending upload)
-                    await self.db.mark_attachment_downloaded(att_id, drive_path)
-
+                await self.db.mark_attachment_downloaded(att_id, drive_path)
             except Exception as e:
-                logger.error(f"Upload failed {local_path.name}: {e}")
-                await self.db.mark_attachment_failed(att_id)
-                self.total_failed += 1
+                logger.debug(f"DB mark failed {att_id}: {e}")
 
-        logger.info(f"Batch flush complete. Total: {self.total_downloaded} downloaded, {self.total_skipped} skipped, {self.total_failed} failed")
+        logger.info(f"Total so far: {self.total_downloaded} downloaded, {self.total_skipped} skipped")
 
     async def finalize(self):
         """Flush any remaining files at the end of extraction."""
